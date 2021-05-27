@@ -158,8 +158,9 @@ class MultiListener:
             for i, (cred, f) in enumerate(zip(self.creds, follow), start=1):
                 auth = tweepy.OAuthHandler(cred.consumer_token, cred.consumer_secret)
                 auth.set_access_token(cred.access_token, cred.access_token_secret)
+                api = tweepy.API(auth, wait_on_rate_limit=True)
                 listener = MongoStreamListener(stream_name=f"stream_{i}")
-                stream = tweepy.Stream(auth = auth, listener=listener)
+                stream = tweepy.Stream(auth = api.auth, listener=listener)
                 stream.filter(
                     follow=f,
                     track=track,
