@@ -1,7 +1,9 @@
-from typing import Any, Dict, List, Literal, NewType, Optional, Tuple, TypeVar, Union
+from typing import Any, Callable, Dict, List, Literal, NewType, Optional, Tuple, TypeVar, Union
 from dataclasses import dataclass
 import datetime as dt
 import logging
+from queue import Queue
+from threading import Thread
 import pymongo
 import tweepy
 
@@ -30,6 +32,7 @@ class MongoStreamListener(tweepy.StreamListener):
         scrub_geo_collection_name: Optional[str] = "status_deletions",
         status_withheld_collection_name: Optional[str] = "status_withhelds",
         user_withheld_collection_name: Optional[str] = "user_withhelds",
+        is_queue: bool = False,
     ):
         super().__init__()
         self.stream_name: str = stream_name
@@ -40,14 +43,54 @@ class MongoStreamListener(tweepy.StreamListener):
         self.user_withheld_collection_name: Optional[str] = user_withheld_collection_name
         self.db_name: str = db_name
         self.mongo_client: pymongo.MongoClient = pymongo.MongoClient()
-        self.db = self.mongo_client[self.db_name]
+        self.db: pymongo.database.Database = self.mongo_client[self.db_name]
+        self.is_queue: bool = is_queue
+        self.queue: Optional[Queue] = Queue() if is_queue else None
+        self.init()
  
+    def init(self) -> None:
+        self.init_mongo_db()
+        self.start_threads(4, self._thread_func)
+
+    def init_mongo_db(self) -> None:
+        if self.status_collection_name:
+            self.db[self.status_collection_name].create_index([("id_str", pymongo.ASCENDING)], unique=True)
+
+    def _thread_func(self, queue: Queue) -> None:
+        if self.is_queue:
+            while True:
+                status = queue.get()
+                self.insert_status_to_db(status)
+                queue.task_done()
+
+    def start_threads(self, num: int, func: Callable) -> None:
+        if self.is_queue:
+            for _ in range(num):
+                t = Thread(target=func, args=(self.queue,))
+                t.daemon = True
+                t.start()
+
+    def insert_status_to_db(self, status: tweepy.Status) -> None:
+        try:
+            self.db[self.status_collection_name].insert_one(status._json)
+        # when multiple streams get the same status (status can satisfy conditions for multiple streams at once),
+        # all except one tries to insert a status that already exists in the database, which causes an error
+        # as `id_str` field must be unique.
+        # simplest solution is catching the exception and ignoring it
+        # one can also use the following (upsert = update if exists, otherwise insert):
+        # self.db[self.status_collection_name].update({"id_str": status._json["id_str"]}, status._json}, upsert=True)
+        except pymongo.errors.DuplicateKeyError:
+            pass
+
     def on_connect(self):
         log.warning(f"stream with name {self.stream_name} starts")
 
     def on_status(self, status: tweepy.Status) -> None:
         if self.status_collection_name:
-            self.db[self.status_collection_name].insert_one(status._json)
+            if self.is_queue:
+                self.queue.put(status)
+            else:
+                self.insert_status_to_db(status)
 
     def on_delete(self, status_id: int, user_id: int):
         if self.status_deletion_collection_name:
@@ -59,7 +102,7 @@ class MongoStreamListener(tweepy.StreamListener):
             self.db[self.status_deletion_collection_name].insert_one(deletion)
 
     def on_error(self, status_code: int) -> bool:
-        log.error(f"HTTP error: {status_code}")
+        log.warning(f"HTTP error: {status_code}")
         return True # Don't kill the stream
  
     def on_scrub_geo(self, notice: Dict[str, Any]) -> None:
@@ -139,6 +182,7 @@ class MultiListener:
         stall_warnings: bool = False,
         encoding: str = "utf-8",
         filter_level: Optional[str] = None,
+        is_queue_in_child_listeners: bool = False,
     ) -> None:
         if isinstance(follow, str):
             follow = [follow]
@@ -159,7 +203,7 @@ class MultiListener:
                 auth = tweepy.OAuthHandler(cred.consumer_token, cred.consumer_secret)
                 auth.set_access_token(cred.access_token, cred.access_token_secret)
                 api = tweepy.API(auth, wait_on_rate_limit=True)
-                listener = MongoStreamListener(stream_name=f"stream_{i}")
+                listener = MongoStreamListener(stream_name=f"stream_{i}", is_queue=is_queue_in_child_listeners)
                 stream = tweepy.Stream(auth = api.auth, listener=listener)
                 stream.filter(
                     follow=f,
@@ -175,7 +219,7 @@ class MultiListener:
             for i, (cred, t) in enumerate(zip(self.creds, track), start=1):
                 auth = tweepy.OAuthHandler(cred.consumer_token, cred.consumer_secret)
                 auth.set_access_token(cred.access_token, cred.access_token_secret)
-                listener = MongoStreamListener(stream_name=f"stream_{i}")
+                listener = MongoStreamListener(stream_name=f"stream_{i}", is_queue=is_queue_in_child_listeners)
                 stream = tweepy.Stream(auth = auth, listener=listener)
                 stream.filter(
                     follow=follow,
@@ -191,7 +235,7 @@ class MultiListener:
             for i, (cred, l) in enumerate(zip(self.creds, locations), start=1):
                 auth = tweepy.OAuthHandler(cred.consumer_token, cred.consumer_secret)
                 auth.set_access_token(cred.access_token, cred.access_token_secret)
-                listener = MongoStreamListener(stream_name=f"stream_{i}")
+                listener = MongoStreamListener(stream_name=f"stream_{i}", is_queue=is_queue_in_child_listeners)
                 stream = tweepy.Stream(auth = auth, listener=listener)
                 stream.filter(
                     follow=follow,
