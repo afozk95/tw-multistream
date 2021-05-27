@@ -4,7 +4,6 @@ import datetime as dt
 import logging
 import pymongo
 import tweepy
-from tweepy.streaming import Stream
 
 
 log = logging.getLogger(__name__)
