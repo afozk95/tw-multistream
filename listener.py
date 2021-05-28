@@ -5,26 +5,48 @@ import logging
 from queue import Queue
 from threading import Thread
 import pymongo
+import requests
 import tweepy
 
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+fh = logging.FileHandler("multistream.log", mode="w")
+fh.setLevel(logging.NOTSET)
+ch = logging.StreamHandler()
+ch.setLevel(logging.NOTSET)
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+fh.setFormatter(formatter)
+ch.setFormatter(formatter)
+logger.addHandler(fh)
+logger.addHandler(ch)
+
+
 LocationBoundingBox = NewType("LocationBoundingBox", Tuple[float, float, float, float])
 T = TypeVar("T")
 
 
 @dataclass
 class Credential:
-    consumer_token: str
+    consumer_key: str
     consumer_secret: str
     access_token: str
     access_token_secret: str
     bearer_token: Optional[str] = None
 
-	
-class MongoStreamListener(tweepy.StreamListener):
+    def to_dict(self) -> Dict[str, str]:
+        data = {
+            "consumer_key": self.consumer_key,
+            "consumer_secret": self.consumer_secret,
+            "access_token": self.access_token,
+            "access_token_secret": self.access_token_secret,
+        }
+        return data
+
+
+class MongoStream(tweepy.Stream):
     def __init__(
         self,
+        cred: Credential,
         stream_name: str,
         db_name: str = "twitter",
         status_collection_name: Optional[str] = "statuses",
@@ -34,7 +56,7 @@ class MongoStreamListener(tweepy.StreamListener):
         user_withheld_collection_name: Optional[str] = "user_withhelds",
         is_queue: bool = False,
     ):
-        super().__init__()
+        super().__init__(**cred.to_dict())
         self.stream_name: str = stream_name
         self.status_collection_name: Optional[str] = status_collection_name
         self.status_deletion_collection_name: Optional[str] = status_deletion_collection_name
@@ -69,10 +91,15 @@ class MongoStreamListener(tweepy.StreamListener):
                 t = Thread(target=func, args=(self.queue,))
                 t.daemon = True
                 t.start()
+                logger.warning(f"(stream {self.stream_name}) worker thread ({t.name}) starts")
 
-    def insert_status_to_db(self, status: tweepy.Status) -> None:
+    def insert_status_to_db(self, status: tweepy.models.Status) -> None:
         try:
-            self.db[self.status_collection_name].insert_one(status._json)
+            data = {
+                **status._json,
+                "collected_at": dt.datetime.utcnow(),
+            }
+            self.db[self.status_collection_name].insert_one(data)
         # when multiple streams get the same status (status can satisfy conditions for multiple streams at once),
         # all except one tries to insert a status that already exists in the database, which causes an error
         # as `id_str` field must be unique.
@@ -82,40 +109,69 @@ class MongoStreamListener(tweepy.StreamListener):
         except pymongo.errors.DuplicateKeyError:
             pass
 
-    def on_connect(self):
-        log.warning(f"stream with name {self.stream_name} starts")
+    def on_closed(self, response: requests.Response) -> None:
+        logger.warning(f"({self.stream_name}) stream connection closed by twitter, {response}")
 
-    def on_status(self, status: tweepy.Status) -> None:
+    def on_connect(self) -> None:
+        logger.warning(f"({self.stream_name}) stream started")
+
+    def on_connection_error(self) -> None:
+        logger.warning(f"({self.stream_name}) stream connection has errored or timed out")
+
+    def on_disconnect(self) -> None:
+        logger.warning(f"({self.stream_name}) stream disconnected")
+
+    def on_exception(self, exception: Exception) -> None:
+        logger.warning(f"({self.stream_name}) stream encountered an exception, {exception}")
+
+    def on_keep_alive(self) -> None:
+        logger.warning(f"({self.stream_name}) stream received keep-alive signal")
+
+    def on_request_error(self, status_code: int) -> None:
+        logger.warning(f"({self.stream_name}) stream encountered HTTP error, {status_code}")
+
+    def on_status(self, status: tweepy.models.Status) -> None:
         if self.status_collection_name:
             if self.is_queue:
                 self.queue.put(status)
             else:
                 self.insert_status_to_db(status)
 
-    def on_delete(self, status_id: int, user_id: int):
+    def on_delete(self, status_id: int, user_id: int) -> None:
+        logger.warning(f"({self.stream_name}) status deletion")
         if self.status_deletion_collection_name:
             deletion = {
-                "deleted_at": dt.datetime.utcnow(),
+                "collected_at": dt.datetime.utcnow(),
                 "user_id": user_id,
                 "status_is": status_id,
             }
             self.db[self.status_deletion_collection_name].insert_one(deletion)
-
-    def on_error(self, status_code: int) -> bool:
-        log.warning(f"HTTP error: {status_code}")
-        return True # Don't kill the stream
  
+    def on_disconnect_message(self, message: Dict[str, Any]) -> None:
+        logger.warning(f"on_disconnect_message {type(message)}")
+        logger.warning(f"({self.stream_name}) stream received disconnect message, {message}")
+
+    def on_limit(self, track: int) -> None:
+        logger.warning(f"({self.stream_name}) stream received limit notice, {track}")
+
     def on_scrub_geo(self, notice: Dict[str, Any]) -> None:
+        logger.warning(f"on_scrub_geo {type(notice)}")
         if self.scrub_geo_collection_name:
             self.db[self.scrub_geo_collection_name].insert_one(notice)
 
-    def on_status_withheld(self, notice):
+    def on_status_withheld(self, notice: Dict[str, Any]) -> None:
+        logger.warning(f"on_status_withheld {type(notice)}")
         if self.status_withheld_collection_name:
             self.db[self.status_withheld_collection_name].insert_one(notice)
 
-    def on_user_withheld(self, notice):
+    def on_user_withheld(self, notice: Dict[str, Any]) -> None:
+        logger.warning(f"on_user_withheld {type(notice)}")
         if self.user_withheld_collection_name:
             self.db[self.user_withheld_collection_name].insert_one(notice)
+
+    def on_warning(self, warning: Dict[str, Any]) -> None:
+        logger.warning(f"on_warning {type(warning)}")
+        logger.warning(f"({self.stream_name}) stream received stall warning, {warning}")
 
 
 class MultiListener:
@@ -125,6 +181,7 @@ class MultiListener:
 
     def __init__(self, creds: List[Credential]) -> None:
         self.creds: List[Credential] = creds
+        self.stream_threads: List[Thread] = []
 
     def infer_parameter_name(
         self,
@@ -141,36 +198,60 @@ class MultiListener:
             elif locations and len(locations) > self.MAX_LOCATIONS_PER_STREAM:
                 parameter_name = "locations"
             else:
-                log.warning("no parameter with length greater than max allowed supplied")
+                logger.warning("no parameter with length greater than max allowed supplied")
                 parameter_name = "follow"
         elif parameter_name == "follow":
             if follow is None:
-                log.warning(f"parameter_name {parameter_name} has value {follow}")
+                logger.warning(f"parameter_name {parameter_name} has value {follow}")
             else:
                 if len(follow) <= self.MAX_FOLLOW_PER_STREAM:
-                    log.warning(f"parameter_name {parameter_name} has length no greater than maximum allowed {self.MAX_FOLLOW_PER_STREAM}")
+                    logger.warning(f"parameter_name {parameter_name} has length no greater than maximum allowed {self.MAX_FOLLOW_PER_STREAM}")
                 else:
                     return parameter_name
         elif parameter_name == "track":
             if track is None:
-                log.warning(f"parameter_name {parameter_name} has value {track}")
+                logger.warning(f"parameter_name {parameter_name} has value {track}")
             else:
                 if len(track) <= self.MAX_TRACK_PER_STREAM:
-                    log.warning(f"parameter_name {parameter_name} has length no greater than maximum allowed {self.MAX_TRACK_PER_STREAM}")
+                    logger.warning(f"parameter_name {parameter_name} has length no greater than maximum allowed {self.MAX_TRACK_PER_STREAM}")
                 else:
                     return parameter_name
         elif parameter_name == "locations":
             if locations is None:
-                log.warning(f"parameter_name {parameter_name} has value {locations}")
+                logger.warning(f"parameter_name {parameter_name} has value {locations}")
             else:
                 if len(locations) <= self.MAX_LOCATIONS_PER_STREAM:
-                    log.warning(f"parameter_name {parameter_name} has length no greater than maximum allowed {self.locations}")
+                    logger.warning(f"parameter_name {parameter_name} has length no greater than maximum allowed {self.locations}")
                 else:
                     return parameter_name
         else:
             raise ValueError(f"unknown parameter_name {parameter_name}")
 
         return parameter_name
+
+    def create_stream(
+        self,
+        cred: Credential,
+        stream_name: str,
+        follow: Optional[List[str]],
+        track: Optional[List[str]],
+        locations: Optional[List[LocationBoundingBox]],
+        languages: Optional[List[str]],
+        stall_warnings: bool = False,
+        filter_level: Optional[str] = None,
+        is_queue_in_child_listeners: bool = False,
+    ) -> None:
+        stream = MongoStream(cred=cred, stream_name=stream_name, is_queue=is_queue_in_child_listeners)
+        stream_thread = stream.filter(
+            follow=follow,
+            track=track,
+            locations=locations,
+            languages=languages,
+            stall_warnings=stall_warnings,
+            filter_level=filter_level,
+            threaded=True,
+        )
+        self.stream_threads.append(stream_thread)
 
     def filter(
         self,
@@ -180,7 +261,6 @@ class MultiListener:
         locations: Optional[Union[LocationBoundingBox, List[LocationBoundingBox]]] = None,
         languages: Optional[Union[str, List[str]]] = None,
         stall_warnings: bool = False,
-        encoding: str = "utf-8",
         filter_level: Optional[str] = None,
         is_queue_in_child_listeners: bool = False,
     ) -> None:
@@ -192,7 +272,7 @@ class MultiListener:
             locations = [locations]
         if isinstance(languages, str):
             languages = [languages]
-        
+
         if parameter_name is None:
             parameter_name = self.infer_parameter_name(parameter_name, follow, track, locations)
 
@@ -200,52 +280,45 @@ class MultiListener:
         follow, track, locations, languages = tuple(parameters.values())
         if parameter_name == "follow":
             for i, (cred, f) in enumerate(zip(self.creds, follow), start=1):
-                auth = tweepy.OAuthHandler(cred.consumer_token, cred.consumer_secret)
-                auth.set_access_token(cred.access_token, cred.access_token_secret)
-                api = tweepy.API(auth, wait_on_rate_limit=True)
-                listener = MongoStreamListener(stream_name=f"stream_{i}", is_queue=is_queue_in_child_listeners)
-                stream = tweepy.Stream(auth = api.auth, listener=listener)
-                stream.filter(
+                stream_name = f"stream_{i}"
+                self.create_stream(
+                    cred=cred,
+                    stream_name=stream_name,
                     follow=f,
                     track=track,
                     locations=locations,
                     languages=languages,
                     stall_warnings=stall_warnings,
-                    encoding=encoding,
                     filter_level=filter_level,
-                    is_async=True,
+                    is_queue_in_child_listeners=is_queue_in_child_listeners,
                 )
         elif parameter_name == "track":
             for i, (cred, t) in enumerate(zip(self.creds, track), start=1):
-                auth = tweepy.OAuthHandler(cred.consumer_token, cred.consumer_secret)
-                auth.set_access_token(cred.access_token, cred.access_token_secret)
-                listener = MongoStreamListener(stream_name=f"stream_{i}", is_queue=is_queue_in_child_listeners)
-                stream = tweepy.Stream(auth = auth, listener=listener)
-                stream.filter(
+                stream_name = f"stream_{i}"
+                self.create_stream(
+                    cred=cred,
+                    stream_name=stream_name,
                     follow=follow,
                     track=t,
                     locations=locations,
                     languages=languages,
                     stall_warnings=stall_warnings,
-                    encoding=encoding,
                     filter_level=filter_level,
-                    is_async=True,
+                    is_queue_in_child_listeners=is_queue_in_child_listeners,
                 )
         elif parameter_name == "locations":
             for i, (cred, l) in enumerate(zip(self.creds, locations), start=1):
-                auth = tweepy.OAuthHandler(cred.consumer_token, cred.consumer_secret)
-                auth.set_access_token(cred.access_token, cred.access_token_secret)
-                listener = MongoStreamListener(stream_name=f"stream_{i}", is_queue=is_queue_in_child_listeners)
-                stream = tweepy.Stream(auth = auth, listener=listener)
-                stream.filter(
+                stream_name = f"stream_{i}"
+                self.create_stream(
+                    cred=cred,
+                    stream_name=stream_name,
                     follow=follow,
                     track=track,
                     locations=l,
                     languages=languages,
                     stall_warnings=stall_warnings,
-                    encoding=encoding,
                     filter_level=filter_level,
-                    is_async=True,
+                    is_queue_in_child_listeners=is_queue_in_child_listeners,
                 )
         else:
             raise ValueError(f"unknown parameter_name {parameter_name}")
